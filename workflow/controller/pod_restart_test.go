@@ -291,3 +291,135 @@ func TestAnalyzePodForRestart(t *testing.T) {
 		})
 	}
 }
+
+func TestIsResourceTemplateInfraFailure(t *testing.T) {
+	tests := []struct {
+		name     string
+		pod      *apiv1.Pod
+		expected bool
+	}{
+		{
+			name: "evicted pod",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase:  apiv1.PodFailed,
+					Reason: "Evicted",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "node shutdown",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase:  apiv1.PodFailed,
+					Reason: "NodeShutdown",
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "OOMKilled main container",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase: apiv1.PodFailed,
+					ContainerStatuses: []apiv1.ContainerStatus{
+						{
+							Name: common.MainContainerName,
+							State: apiv1.ContainerState{
+								Terminated: &apiv1.ContainerStateTerminated{
+									ExitCode: 137,
+									Reason:   "OOMKilled",
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "signal killed main container (SIGKILL exit code 137)",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase: apiv1.PodFailed,
+					ContainerStatuses: []apiv1.ContainerStatus{
+						{
+							Name: common.MainContainerName,
+							State: apiv1.ContainerState{
+								Terminated: &apiv1.ContainerStateTerminated{
+									ExitCode: 137,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: true,
+		},
+		{
+			name: "normal exit code 1 (kubectl error)",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase: apiv1.PodFailed,
+					ContainerStatuses: []apiv1.ContainerStatus{
+						{
+							Name: common.MainContainerName,
+							State: apiv1.ContainerState{
+								Terminated: &apiv1.ContainerStateTerminated{
+									ExitCode: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "no container statuses and no restartable reason",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase:  apiv1.PodFailed,
+					Reason: "Error",
+				},
+			},
+			expected: false,
+		},
+		{
+			name: "non-main container OOMKilled should not match",
+			pod: &apiv1.Pod{
+				Status: apiv1.PodStatus{
+					Phase: apiv1.PodFailed,
+					ContainerStatuses: []apiv1.ContainerStatus{
+						{
+							Name: "sidecar",
+							State: apiv1.ContainerState{
+								Terminated: &apiv1.ContainerStateTerminated{
+									ExitCode: 137,
+									Reason:   "OOMKilled",
+								},
+							},
+						},
+						{
+							Name: common.MainContainerName,
+							State: apiv1.ContainerState{
+								Terminated: &apiv1.ContainerStateTerminated{
+									ExitCode: 1,
+								},
+							},
+						},
+					},
+				},
+			},
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isResourceTemplateInfraFailure(tt.pod)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
+}

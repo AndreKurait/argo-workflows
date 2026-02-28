@@ -1274,6 +1274,22 @@ func (woc *wfOperationCtx) podReconciliation(ctx context.Context) (bool, error) 
 				continue
 			}
 
+			// For resource template nodes, re-create the executor pod instead of failing.
+			// The executor pod is just infrastructure — the underlying resource may still be healthy.
+			if woc.shouldRestartResourceTemplatePod(ctx, &node) {
+				node.FailedPodRestarts++
+				node.Phase = wfv1.NodePending
+				node.Message = fmt.Sprintf("executor pod deleted, re-creating (attempt %d)", node.FailedPodRestarts)
+				woc.wf.Status.Nodes.Set(ctx, nodeID, node)
+				woc.updated = true
+				woc.log.WithFields(logging.Fields{
+					"nodeName":     node.Name,
+					"restartCount": node.FailedPodRestarts,
+				}).Info(ctx, "Resource template executor pod missing - marking as pending for re-creation")
+				woc.requeue()
+				continue
+			}
+
 			if node.Daemoned != nil && *node.Daemoned {
 				node.Daemoned = nil
 				woc.updated = true
@@ -1449,6 +1465,22 @@ func (woc *wfOperationCtx) assessNodeStatus(ctx context.Context, pod *apiv1.Pod,
 			}
 			// Issue a delete request by UID here in case we lost the delete request
 			// since the last call to operate() (for example: controller restart)
+			woc.controller.PodController.DeletePodByUID(ctx, pod.Namespace, pod.Name, podUID)
+		} else if woc.shouldRestartResourceTemplatePod(ctx, old) && isResourceTemplateInfraFailure(pod) {
+			// Resource template executor pod failed due to infrastructure issues (OOM, signal kill, eviction).
+			// The underlying resource may still be healthy — re-create the executor to resume monitoring.
+			if podUID != old.RestartingPodUID {
+				updated.FailedPodRestarts++
+				updated.RestartingPodUID = podUID
+				woc.log.WithFields(logging.Fields{
+					"podName":      pod.Name,
+					"nodeID":       old.ID,
+					"restartCount": updated.FailedPodRestarts,
+					"reason":       pod.Status.Reason,
+				}).Info(ctx, "Resource template executor pod failed due to infrastructure issue - marking as pending for re-creation")
+				updated.Phase = wfv1.NodePending
+				updated.Message = fmt.Sprintf("executor pod failed (%s), re-creating (attempt %d)", pod.Status.Reason, updated.FailedPodRestarts)
+			}
 			woc.controller.PodController.DeletePodByUID(ctx, pod.Namespace, pod.Name, podUID)
 		}
 	case apiv1.PodRunning:
@@ -1848,6 +1880,49 @@ func (woc *wfOperationCtx) shouldAutoRestartPod(ctx context.Context, pod *apiv1.
 	}
 
 	return true
+}
+
+// maxResourceTemplateRestarts is the maximum number of times a resource template executor pod
+// will be re-created when it disappears or fails due to infrastructure issues.
+const maxResourceTemplateRestarts int32 = 3
+
+// shouldRestartResourceTemplatePod checks if a node is a resource template and hasn't exceeded
+// the restart limit. Resource template executor pods are infrastructure — if they die, the
+// underlying resource may still be healthy, so we re-create the executor to resume monitoring.
+func (woc *wfOperationCtx) shouldRestartResourceTemplatePod(ctx context.Context, node *wfv1.NodeStatus) bool {
+	if node.FailedPodRestarts >= maxResourceTemplateRestarts {
+		return false
+	}
+	tmpl, err := woc.GetNodeTemplate(ctx, node)
+	if err != nil || tmpl == nil {
+		return false
+	}
+	return tmpl.GetType() == wfv1.TemplateTypeResource
+}
+
+// isResourceTemplateInfraFailure checks if a resource template's pod failed due to infrastructure
+// issues (OOMKilled, signal kill, eviction) rather than a legitimate executor error.
+func isResourceTemplateInfraFailure(pod *apiv1.Pod) bool {
+	// Pod-level infrastructure reasons
+	if isRestartableReason(pod.Status.Reason) {
+		return true
+	}
+	// Check main container for OOMKilled or signal kills
+	for _, cs := range pod.Status.ContainerStatuses {
+		if cs.Name != common.MainContainerName {
+			continue
+		}
+		if cs.State.Terminated != nil {
+			if cs.State.Terminated.Reason == "OOMKilled" {
+				return true
+			}
+			// Exit code >= 128 means killed by signal (128 + signal number)
+			if cs.State.Terminated.ExitCode >= 128 {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func (woc *wfOperationCtx) createPVCs(ctx context.Context) error {

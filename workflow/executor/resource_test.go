@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"fmt"
 	"os"
 	"path"
 	"runtime"
@@ -245,4 +246,45 @@ func Test_runKubectl(t *testing.T) {
 	out, err := runKubectl(ctx, "kubectl", "version", "--client=true", "--output", "json")
 	require.NoError(t, err)
 	assert.Contains(t, string(out), "clientVersion")
+}
+
+func TestIsAlreadyExistsErr(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		expected bool
+	}{
+		{
+			name:     "nil error",
+			err:      nil,
+			expected: false,
+		},
+		{
+			name:     "already exists error from kubectl",
+			err:      fmt.Errorf(`Error from server (AlreadyExists): jobs.batch "test-job" already exists`),
+			expected: true,
+		},
+		{
+			name:     "already exists lowercase",
+			err:      fmt.Errorf("resource already exists"),
+			expected: true,
+		},
+		{
+			name:     "unrelated error",
+			err:      fmt.Errorf("connection refused"),
+			expected: false,
+		},
+		{
+			name:     "not found error",
+			err:      fmt.Errorf("not found"),
+			expected: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			result := isAlreadyExistsErr(tt.err)
+			assert.Equal(t, tt.expected, result)
+		})
+	}
 }
